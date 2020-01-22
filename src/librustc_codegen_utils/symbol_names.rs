@@ -129,26 +129,8 @@ fn symbol_name_provider(tcx: TyCtxt<'tcx>, instance: Instance<'tcx>) -> ty::Symb
         //
         // For generics we might find re-usable upstream instances. For anything
         // else we rely on their being a local copy available.
-
         if is_generic(instance.substs) {
-            let def_id = instance.def_id();
-
-            if !def_id.is_local() && tcx.sess.opts.share_generics() {
-                // If we are re-using a monomorphization from another crate,
-                // we have to compute the symbol hash accordingly.
-                let upstream_monomorphizations = tcx.upstream_monomorphizations_for(def_id);
-
-                upstream_monomorphizations
-                    .and_then(|monos| monos.get(&instance.substs).cloned())
-                    // If there is no instance available upstream, there'll be
-                    // one in the current crate.
-                    .unwrap_or(LOCAL_CRATE)
-            } else {
-                // For generic functions defined in the current crate, there
-                // can be no upstream instances. Also, if we don't share
-                // generics, we'll instantiate a local copy too.
-                LOCAL_CRATE
-            }
+            instance.upstream_monomorphization(tcx).unwrap_or(LOCAL_CRATE)
         } else {
             // For non-generic things that need to avoid naming conflicts, we
             // always instantiate a copy in the local crate.
