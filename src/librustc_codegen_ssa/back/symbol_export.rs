@@ -5,7 +5,7 @@ use rustc::middle::codegen_fn_attrs::CodegenFnAttrFlags;
 use rustc::middle::exported_symbols::{metadata_symbol_name, ExportedSymbol, SymbolExportLevel};
 use rustc::session::config;
 use rustc::ty::query::Providers;
-use rustc::ty::subst::SubstsRef;
+use rustc::ty::subst::{GenericArgKind, SubstsRef};
 use rustc::ty::Instance;
 use rustc::ty::{SymbolName, TyCtxt};
 use rustc_codegen_utils::symbol_names;
@@ -16,8 +16,6 @@ use rustc_hir::def_id::{CrateNum, DefId, DefIdMap, CRATE_DEF_INDEX, LOCAL_CRATE}
 use rustc_hir::Node;
 use rustc_index::vec::IndexVec;
 use syntax::expand::allocator::ALLOCATOR_METHODS;
-
-pub type ExportedSymbols = FxHashMap<CrateNum, Arc<Vec<(String, SymbolExportLevel)>>>;
 
 pub fn threshold(tcx: TyCtxt<'_>) -> SymbolExportLevel {
     crates_export_threshold(&tcx.sess.crate_types.borrow())
@@ -96,7 +94,7 @@ fn reachable_non_generics_provider(
                     if !generics.requires_monomorphization(tcx) &&
                         // Functions marked with #[inline] are only ever codegened
                         // with "internal" linkage and are never exported.
-                        !Instance::mono(tcx, def_id).def.requires_local(tcx)
+                        !Instance::mono(tcx, def_id).def.generates_cgu_internal_copy(tcx)
                     {
                         Some(def_id)
                     } else {
@@ -240,19 +238,31 @@ fn exported_symbols_provider_local(
                 continue;
             }
 
-            if let &MonoItem::Fn(Instance { def: InstanceDef::Item(def_id), substs }) = mono_item {
-                if substs.non_erasable_generics().next().is_some() {
-                    symbols
-                        .push((ExportedSymbol::Generic(def_id, substs), SymbolExportLevel::Rust));
+            match *mono_item {
+                MonoItem::Fn(Instance { def: InstanceDef::Item(def_id), substs }) => {
+                    if substs.non_erasable_generics().next().is_some() {
+                        let symbol = ExportedSymbol::Generic(def_id, substs);
+                        symbols.push((symbol, SymbolExportLevel::Rust));
+                    }
+                }
+                MonoItem::Fn(Instance { def: InstanceDef::DropGlue(def_id, Some(ty)), substs }) => {
+                    // A little sanity-check
+                    debug_assert_eq!(
+                        substs.non_erasable_generics().next(),
+                        Some(GenericArgKind::Type(ty))
+                    );
+                    let symbol = ExportedSymbol::Generic(def_id, substs);
+                    symbols.push((symbol, SymbolExportLevel::Rust));
+                }
+                _ => {
+                    // Any other symbols don't qualify for sharing
                 }
             }
         }
     }
 
     // Sort so we get a stable incr. comp. hash.
-    symbols.sort_unstable_by(|&(ref symbol1, ..), &(ref symbol2, ..)| {
-        symbol1.compare_stable(tcx, symbol2)
-    });
+    symbols.sort_by_cached_key(|s| s.0.symbol_name_for_local_instance(tcx));
 
     Arc::new(symbols)
 }
@@ -311,6 +321,17 @@ fn upstream_monomorphizations_for_provider(
     tcx.upstream_monomorphizations(LOCAL_CRATE).get(&def_id)
 }
 
+fn upstream_drop_glue_for_provider<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    substs: SubstsRef<'tcx>,
+) -> Option<CrateNum> {
+    if let Some(def_id) = tcx.lang_items().drop_in_place_fn() {
+        tcx.upstream_monomorphizations(LOCAL_CRATE).get(&def_id).and_then(|monos| monos.get(&substs).cloned())
+    } else {
+        None
+    }
+}
+
 fn is_unreachable_local_definition_provider(tcx: TyCtxt<'_>, def_id: DefId) -> bool {
     if let Some(hir_id) = tcx.hir().as_local_hir_id(def_id) {
         !tcx.reachable_set(LOCAL_CRATE).contains(&hir_id)
@@ -325,6 +346,7 @@ pub fn provide(providers: &mut Providers<'_>) {
     providers.exported_symbols = exported_symbols_provider_local;
     providers.upstream_monomorphizations = upstream_monomorphizations_provider;
     providers.is_unreachable_local_definition = is_unreachable_local_definition_provider;
+    providers.upstream_drop_glue_for = upstream_drop_glue_for_provider;
 }
 
 pub fn provide_extern(providers: &mut Providers<'_>) {
